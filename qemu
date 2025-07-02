@@ -1,0 +1,482 @@
+#!/bin/bash
+
+# Configuración básica
+BASEDIR=$(cd "$(dirname "$0")"; pwd)
+IMAGES_DIR="$BASEDIR/images"
+FIRMWARE_DIR="$BASEDIR/firmware"
+VMS_DIR="$BASEDIR/vms"
+CONFIG_DIR="$BASEDIR/config"
+LOGS_DIR="$BASEDIR/logs"
+
+# Imagen base Ubuntu Cloud ARM64 (no modificar)
+CLOUD_IMG="$IMAGES_DIR/ubuntu-24.04-cloud-arm64.img"
+CLOUD_IMG_URL="https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-arm64.img"
+
+# Archivos de trabajo
+WORK_IMG="$VMS_DIR/ubuntu-cloud-vm.img"
+PIDFILE="$VMS_DIR/vm.pid"
+LOGFILE="$LOGS_DIR/vm.log"
+
+# Archivos cloud-init
+CLOUD_INIT_ISO="$CONFIG_DIR/cloud-init.iso"
+USER_DATA="$CONFIG_DIR/user-data"
+META_DATA="$CONFIG_DIR/meta-data"
+
+# Firmware UEFI
+UEFI_CODE="$FIRMWARE_DIR/QEMU_EFI.fd"
+UEFI_VARS_TEMPLATE="$FIRMWARE_DIR/QEMU_VARS.fd"
+UEFI_VARS_WORK="$VMS_DIR/QEMU_VARS_work.fd"
+
+# Especificaciones Raspberry Pi 3 B+
+MEMORY=1024        # 1GB RAM como RPi 3 B+
+CPU="cortex-a57"   # CPU ARM Cortex-A57 (más compatible que A53)
+CORES=4            # Quad-core como RPi 3 B+
+QEMU=qemu-system-aarch64
+
+function help {
+  echo -e "\n🍓 QEMU Raspberry Pi 3 B+ (Ubuntu 24.04 ARM64) con UEFI"
+  echo "Uso: $0 [create|delete|start|stop|status|download]"
+  echo -e "\nComandos:"
+  echo "  download - Descarga la imagen Ubuntu Cloud ARM64"
+  echo "  create   - Crea la VM usando imagen cloud"
+  echo "  delete   - Borra la VM y archivos de trabajo"
+  echo "  start    - Inicia la VM con specs RPi 3 B+ (SSH en puerto 2223)"
+  echo "  stop     - Apaga la VM gracefully"
+  echo "  status   - Muestra el estado actual de la VM"
+  echo -e "\nConéctate por SSH: ssh ubuntu@localhost -p 2223"
+  echo "Usuario/contraseña por defecto: ubuntu/ubuntu"
+  echo -e "\nEspecificaciones emuladas:"
+  echo "  CPU: ARM Cortex-A53 quad-core (como RPi 3 B+)"
+  echo "  RAM: 1GB (como RPi 3 B+)"
+  echo "  Boot: UEFI con firmware EDK2"
+  echo -e "\nPrimeros pasos:"
+  echo "  1. $0 download  # Descargar imagen Ubuntu Cloud"
+  echo "  2. $0 create    # Crear la VM"
+  echo "  3. $0 start     # Iniciar la VM"
+  echo -e "\nEstructura de archivos:"
+  echo "  images/   - Imagen base Ubuntu Cloud (NO tocar)"
+  echo "  vms/      - Archivos de trabajo de la VM"
+  echo "  config/   - Configuración cloud-init"
+  echo "  firmware/ - Firmware UEFI ARM64"
+  echo "  logs/     - Registros de la VM"
+}
+
+function verificar_dependencias {
+  # Verificar QEMU
+  if ! command -v $QEMU >/dev/null 2>&1; then
+    echo "❌ $QEMU no encontrado. Instala QEMU para ARM64:"
+    echo "   macOS: brew install qemu"
+    echo "   Ubuntu: sudo apt install qemu-system-arm"
+    exit 1
+  fi
+  
+  # Verificar firmware UEFI (usar el de QEMU en macOS)
+  local SYSTEM_UEFI="/opt/homebrew/share/qemu/edk2-aarch64-code.fd"
+  if [ -f "$SYSTEM_UEFI" ]; then
+    # Usar firmware del sistema
+    echo "✅ Usando firmware UEFI del sistema"
+    if [ ! -f "$UEFI_CODE" ]; then
+      cp "$SYSTEM_UEFI" "$UEFI_CODE"
+    fi
+  elif [ ! -f "$UEFI_CODE" ]; then
+    echo "❌ Firmware UEFI no encontrado"
+    echo "   Descargando firmware UEFI..."
+    mkdir -p "$FIRMWARE_DIR"
+    curl -L -o "$UEFI_CODE" https://releases.linaro.org/components/kernel/uefi-linaro/latest/release/qemu64/QEMU_EFI.fd
+  fi
+  
+  # Crear archivo de variables UEFI si no existe
+  if [ ! -f "$UEFI_VARS_TEMPLATE" ]; then
+    echo "🔧 Creando archivo de variables UEFI..."
+    dd if=/dev/zero of="$UEFI_VARS_TEMPLATE" bs=1M count=64 2>/dev/null
+  fi
+  
+  # Crear directorios si no existen
+  mkdir -p "$VMS_DIR" "$CONFIG_DIR" "$LOGS_DIR"
+}
+
+function crear_cloud_init {
+  echo "☁️  Creando configuración cloud-init..."
+  
+  # Crear user-data para cloud-init
+  cat > "$USER_DATA" << 'EOF'
+#cloud-config
+users:
+  - name: ubuntu
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    # Contraseña hasheada para 'ubuntu' (generada con: openssl passwd -6 ubuntu)
+    password: $6$uqXSugPCQSGUpllA$ognUeLkpF.jM0sc2TOkkx7zODxVTa0rWZf6UZDB2fWqk9uC2EPiZYsRYOzkJ4cO1lKbCHPW4SjYQFgFqZKUva.
+    chpasswd: { expire: False }
+    ssh_authorized_keys: []
+
+ssh_pwauth: True
+package_update: true
+package_upgrade: true
+
+# Instalar herramientas básicas
+packages:
+  - htop
+  - curl
+  - wget
+  - git
+  - vim
+
+# Configurar contraseña de texto plano como respaldo
+chpasswd:
+  list: |
+    ubuntu:ubuntu
+  expire: False
+
+# Habilitar SSH inmediatamente
+runcmd:
+  - systemctl enable ssh
+  - systemctl start ssh
+  - echo "SSH habilitado" >> /var/log/cloud-init-output.log
+EOF
+
+  # Crear meta-data
+  cat > "$META_DATA" << 'EOF'
+instance-id: ubuntu-rpi3-vm
+local-hostname: ubuntu-rpi3
+EOF
+
+  # Crear ISO cloud-init
+  if command -v genisoimage >/dev/null 2>&1; then
+    genisoimage -output "$CLOUD_INIT_ISO" -volid cidata -joliet -rock "$USER_DATA" "$META_DATA" 2>/dev/null
+  elif command -v mkisofs >/dev/null 2>&1; then
+    mkisofs -o "$CLOUD_INIT_ISO" -V cidata -J -r "$USER_DATA" "$META_DATA" 2>/dev/null
+  else
+    echo "⚠️  No se pudo crear cloud-init.iso (falta genisoimage/mkisofs)"
+    echo "    macOS: brew install cdrtools"
+    echo "    Ubuntu: sudo apt install genisoimage"
+    echo "    La VM arrancará pero necesitarás configurar manualmente"
+    return 1
+  fi
+  
+  echo "✅ Cloud-init configurado"
+  return 0
+}
+
+function download {
+  echo "📥 Descargando imagen Ubuntu 24.04 Cloud ARM64..."
+  mkdir -p "$IMAGES_DIR"
+  
+  if [ -f "$CLOUD_IMG" ]; then
+    echo "⚠️  La imagen ya existe. ¿Descargar de nuevo? (y/N)"
+    read -r response
+    if [[ ! "$response" =~ ^[Yy]$ ]]; then
+      echo "ℹ️  Descarga cancelada"
+      return 0
+    fi
+    rm -f "$CLOUD_IMG"
+  fi
+  
+  echo "🌐 Descargando desde: $CLOUD_IMG_URL"
+  if command -v curl >/dev/null 2>&1; then
+    curl -L --progress-bar -o "$CLOUD_IMG" "$CLOUD_IMG_URL"
+  elif command -v wget >/dev/null 2>&1; then
+    wget --progress=bar -O "$CLOUD_IMG" "$CLOUD_IMG_URL"
+  else
+    echo "❌ No se encontró curl ni wget"
+    echo "   macOS: brew install curl"
+    echo "   Ubuntu: sudo apt install curl"
+    exit 1
+  fi
+  
+  if [ -f "$CLOUD_IMG" ]; then
+    SIZE=$(du -h "$CLOUD_IMG" | cut -f1)
+    echo "✅ Imagen descargada: $(basename "$CLOUD_IMG") ($SIZE)"
+  else
+    echo "❌ Error descargando la imagen"
+    exit 1
+  fi
+}
+
+function create {
+  verificar_dependencias
+  
+  # Verificar que existe la imagen cloud
+  if [ ! -f "$CLOUD_IMG" ]; then
+    echo "❌ No se encuentra la imagen Ubuntu Cloud en $CLOUD_IMG"
+    echo "   Ejecuta: $0 download"
+    exit 1
+  fi
+  
+  echo "🌥️  Usando imagen Ubuntu Cloud ARM64"
+  crear_cloud_init
+  
+  if [ -f "$WORK_IMG" ]; then
+    echo "⚠️  Ya existe una VM, borrando..."
+    delete
+  fi
+  
+  # Limpiar claves SSH anteriores para evitar conflictos
+  echo "🔑 Limpiando claves SSH anteriores del puerto 2223..."
+  ssh-keygen -R "[localhost]:2223" 2>/dev/null || true
+  
+  echo "🧪 Creando imagen de trabajo..."
+  cp "$CLOUD_IMG" "$WORK_IMG"
+  
+  # Convertir a qcow2 para mejor rendimiento
+  echo "🔄 Convirtiendo a formato qcow2 para mejor rendimiento..."
+  qemu-img convert -f qcow2 -O qcow2 "$WORK_IMG" "$WORK_IMG.qcow2"
+  mv "$WORK_IMG.qcow2" "$WORK_IMG"
+  
+  # Expandir imagen a 8GB para tener espacio
+  echo "🔄 Expandiendo imagen a 8GB..."
+  qemu-img resize "$WORK_IMG" 8G
+  
+  # Crear copia de variables UEFI para esta VM
+  if [ -f "$UEFI_VARS_TEMPLATE" ]; then
+    cp "$UEFI_VARS_TEMPLATE" "$UEFI_VARS_WORK"
+  fi
+  
+  echo "✅ VM creada: $(basename "$WORK_IMG")"
+  echo "📁 Archivos en: $VMS_DIR"
+}
+
+function delete {
+  if [ -f "$PIDFILE" ]; then
+    stop
+  fi
+  
+  # Borrar imagen de trabajo
+  if [ -f "$WORK_IMG" ]; then
+    echo "🗑️  Borrando imagen de trabajo..."
+    rm -f "$WORK_IMG"
+    echo "✅ VM eliminada"
+  else
+    echo "ℹ️  No hay VM para borrar"
+  fi
+  
+  # Limpiar archivos UEFI de trabajo
+  if [ -f "$UEFI_VARS_WORK" ]; then
+    echo "🗑️  Limpiando variables UEFI de trabajo..."
+    rm -f "$UEFI_VARS_WORK"
+  fi
+  
+  # Limpiar archivos UEFI y cloud-init
+  if [ -f "$UEFI_VARS_WORK" ]; then
+    echo "🗑️  Limpiando variables UEFI de trabajo..."
+    rm -f "$UEFI_VARS_WORK"
+  fi
+  
+  if [ -f "$CLOUD_INIT_ISO" ] || [ -f "$USER_DATA" ] || [ -f "$META_DATA" ]; then
+    echo "🗑️  Limpiando archivos cloud-init..."
+    rm -f "$CLOUD_INIT_ISO" "$USER_DATA" "$META_DATA"
+  fi
+  
+  rm -f "$PIDFILE" "$LOGFILE"
+  
+  # Limpiar claves SSH del puerto 2223
+  echo "🔑 Limpiando claves SSH del puerto 2223..."
+  ssh-keygen -R "[localhost]:2223" 2>/dev/null || true
+}
+
+function start {
+  verificar_dependencias
+  
+  # Verificar que existe la VM
+  if [ ! -f "$WORK_IMG" ]; then
+    echo "❌ No existe VM. Usa: $0 create"
+    exit 1
+  fi
+  
+  echo "🌥️  Usando imagen Ubuntu Cloud"
+  
+  if [ -f "$PIDFILE" ]; then
+    PID=$(cat "$PIDFILE")
+    if kill -0 $PID 2>/dev/null; then
+      echo "⚠️  La VM ya está corriendo (PID $PID)"
+      echo "SSH: ssh ubuntu@localhost -p 2223"
+      exit 0
+    fi
+  fi
+  
+  echo "🚀 Iniciando VM con especificaciones Raspberry Pi 3 B+..."
+  echo "   CPU: ARM Cortex-A53 ${CORES}-core"
+  echo "   RAM: ${MEMORY}MB"
+  echo "   Boot: UEFI con pflash (configuración Ubuntu Wiki)"
+  
+  # Configuración UEFI con pflash (basada en Ubuntu Wiki oficial)
+  QEMU_ARGS="-M virt -cpu $CPU -smp $CORES -m $MEMORY -nographic"
+  
+  # Usar firmware del sistema directamente si está disponible
+  if [ -f "/opt/homebrew/share/qemu/edk2-aarch64-code.fd" ]; then
+    echo "🔧 Usando firmware UEFI del sistema homebrew"
+    QEMU_ARGS="$QEMU_ARGS -drive if=pflash,format=raw,file=/opt/homebrew/share/qemu/edk2-aarch64-code.fd,readonly=on"
+    # Crear variables UEFI temporales
+    dd if=/dev/zero of="$UEFI_VARS_WORK" bs=1M count=64 2>/dev/null
+    QEMU_ARGS="$QEMU_ARGS -drive if=pflash,format=raw,file=$UEFI_VARS_WORK"
+  else
+    echo "🔧 Usando firmware UEFI local"
+    QEMU_ARGS="$QEMU_ARGS -drive if=pflash,format=raw,file=$UEFI_CODE,readonly=on"
+    QEMU_ARGS="$QEMU_ARGS -drive if=pflash,format=raw,file=$UEFI_VARS_WORK"
+  fi
+  
+  # Configuración cloud image estilo Ubuntu Wiki
+  echo "🔍 Iniciando con imagen cloud + cloud-init..."
+  QEMU_ARGS="$QEMU_ARGS -drive if=none,file=$WORK_IMG,id=hd0"
+  QEMU_ARGS="$QEMU_ARGS -device virtio-blk-device,drive=hd0"
+  if [ -f "$CLOUD_INIT_ISO" ]; then
+    QEMU_ARGS="$QEMU_ARGS -drive if=none,file=$CLOUD_INIT_ISO,format=raw,id=cd0"
+    QEMU_ARGS="$QEMU_ARGS -device virtio-blk-device,drive=cd0"
+  fi
+  
+  # Red estilo Ubuntu Wiki para macOS
+  QEMU_ARGS="$QEMU_ARGS -netdev user,id=net0,hostfwd=tcp::2223-:22"
+  QEMU_ARGS="$QEMU_ARGS -device virtio-net-device,netdev=net0"
+  
+  # Crear archivo de log
+  mkdir -p "$LOGS_DIR"
+  
+  echo "🔧 Comando completo: $QEMU $QEMU_ARGS"
+  nohup $QEMU $QEMU_ARGS > "$LOGFILE" 2>&1 &
+  VM_PID=$!
+  echo $VM_PID > "$PIDFILE"
+  
+  sleep 3
+  echo "✅ VM iniciada (PID $VM_PID)"
+  echo "🔍 Verificando arranque..."
+  
+  # Verificar que el proceso siga corriendo
+  if ! kill -0 $VM_PID 2>/dev/null; then
+    echo "❌ La VM se cerró inesperadamente"
+    echo "📝 Últimas líneas del log:"
+    tail -10 "$LOGFILE" 2>/dev/null || echo "No hay log disponible"
+    rm -f "$PIDFILE"
+    exit 1
+  fi
+  
+  sleep 2
+  if [ -s "$LOGFILE" ]; then
+    echo "📝 Log generándose correctamente"
+  else
+    echo "⚠️  El log está vacío, revisar configuración"
+  fi
+  
+  echo -e "\n🌐 Conexión SSH:"
+  echo "   ssh ubuntu@localhost -p 2223"
+  echo "   Usuario/contraseña: ubuntu/ubuntu"
+  echo -e "\n📊 Monitoreo:"
+  echo "   Estado: $0 status"
+  echo "   Log: tail -f $LOGFILE"
+}
+
+function stop {
+  if [ ! -f "$PIDFILE" ]; then
+    echo "ℹ️  No hay VM corriendo"
+    return
+  fi
+  
+  PID=$(cat "$PIDFILE")
+  if ! kill -0 $PID 2>/dev/null; then
+    echo "ℹ️  Proceso ya no existe"
+    rm -f "$PIDFILE"
+    return
+  fi
+  
+  echo "⚡ Enviando señal de apagado graceful..."
+  kill -TERM $PID
+  
+  # Esperar apagado graceful
+  for i in {1..10}; do
+    if ! kill -0 $PID 2>/dev/null; then
+      echo "✅ VM apagada gracefully"
+      rm -f "$PIDFILE"
+      return
+    fi
+    sleep 1
+    echo -n "."
+  done
+  
+  echo -e "\n🔨 Forzando apagado..."
+  kill -9 $PID 2>/dev/null
+  sleep 1
+  
+  if ! kill -0 $PID 2>/dev/null; then
+    echo "✅ VM terminada"
+  else
+    echo "⚠️  No se pudo terminar el proceso"
+  fi
+  
+  rm -f "$PIDFILE"
+}
+
+function status {
+  echo "🔍 Estado del sistema QEMU Raspberry Pi 3 B+"
+  echo "================================================"
+  
+  # Estado de la VM
+  if [ -f "$PIDFILE" ]; then
+    PID=$(cat "$PIDFILE")
+    if kill -0 $PID 2>/dev/null; then
+      echo "🟢 VM: CORRIENDO (PID $PID)"
+      echo "   SSH: ssh ubuntu@localhost -p 2223"
+    else
+      echo "🔴 VM: PARADA (archivo PID obsoleto)"
+      rm -f "$PIDFILE"
+    fi
+  else
+    echo "🔴 VM: PARADA"
+  fi
+  
+  # Estado de imagen base
+  echo -e "\n📦 Imagen base:"
+  if [ -f "$CLOUD_IMG" ]; then
+    SIZE=$(du -h "$CLOUD_IMG" | cut -f1)
+    echo "   ✅ Ubuntu Cloud: $(basename "$CLOUD_IMG") ($SIZE)"
+  else
+    echo "   ❌ Ubuntu Cloud: No encontrada (ejecuta: $0 download)"
+  fi
+  
+  # Estado de VM de trabajo
+  echo -e "\n🖥️  VM de trabajo:"
+  if [ -f "$WORK_IMG" ]; then
+    SIZE=$(du -h "$WORK_IMG" | cut -f1)
+    echo "   ✅ VM: $(basename "$WORK_IMG") ($SIZE)"
+  else
+    echo "   ❌ No hay VM creada (ejecuta: $0 create)"
+  fi
+  
+  # Estado firmware UEFI
+  echo -e "\n🔧 Firmware UEFI:"
+  if [ -f "$UEFI_CODE" ]; then
+    echo "   ✅ UEFI Code: $(basename "$UEFI_CODE")"
+  else
+    echo "   ❌ UEFI Code: No encontrado"
+  fi
+  
+  if [ -f "$UEFI_VARS_WORK" ]; then
+    echo "   ✅ UEFI Variables: $(basename "$UEFI_VARS_WORK")"
+  else
+    echo "   ⚠️  UEFI Variables: No creadas"
+  fi
+  
+  # Log reciente
+  if [ -f "$LOGFILE" ] && [ -s "$LOGFILE" ]; then
+    echo -e "\n📝 Últimas líneas del log:"
+    tail -5 "$LOGFILE" | sed 's/^/   /'
+  fi
+}
+
+case "$1" in
+  download) download ;;
+  create) create ;;
+  delete) delete ;;
+  start) start ;;
+  stop) stop ;;
+  status) status ;;
+  "")
+    # Sin argumentos, mostrar ayuda
+    help
+    ;;
+  *)
+    # Comando inválido
+    echo "❌ Comando inválido: '$1'"
+    echo ""
+    help
+    exit 1
+    ;;
+esac

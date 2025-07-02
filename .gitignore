@@ -1,0 +1,46 @@
+# Directorios de archivos de trabajo
+vms/
+logs/
+config/
+firmware/
+
+# Imagen base Ubuntu Cloud (se descarga con ./qemu download)
+images/
+
+# Archivos temporales
+*.tmp
+*.temp
+*.log
+*.pid
+
+# Archivos de sistema macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Archivos de sistema Linux
+*~
+.nfs*
+
+# Archivos de editor
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Archivos de backup
+*.bak
+*.backup
+*.old
+
+# Archivos QEMU específicos
+*.qcow2
+*.img
+*.iso
+*.fd
+nohup.out
+
+# Variables de entorno locales
+.env
+.env.local 
