@@ -223,9 +223,9 @@ function create {
   qemu-img convert -f qcow2 -O qcow2 "$WORK_IMG" "$WORK_IMG.qcow2"
   mv "$WORK_IMG.qcow2" "$WORK_IMG"
   
-  # Expandir imagen a 8GB para tener espacio
-  echo "🔄 Expandiendo imagen a 8GB..."
-  qemu-img resize "$WORK_IMG" 8G
+  # Expandir imagen a 15GB para tener espacio
+  echo "🔄 Expandiendo imagen a 15GB..."
+  qemu-img resize "$WORK_IMG" 15G
   
   # Crear copia de variables UEFI para esta VM
   if [ -f "$UEFI_VARS_TEMPLATE" ]; then
